@@ -88,6 +88,35 @@ fn errno() -> c_int {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+thread_local! {
+    /// Why this thread's last [`connect_timeout_cause`] attempt FAILED (an errno, or the socket's
+    /// `SO_ERROR`), for the one log line a plaintext connect failure gets. 0 = not recorded.
+    static LAST_CONNECT_ERR: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
+}
+
+/// The plaintext transport's failures used to be SILENT: a refused connect, a reset send and a
+/// server that closed before answering all reached `http::plaintext` as "status 0" and its callers
+/// as `None`. A webOS 3.8 set's Jellyfin sign-in failed exactly that way — "can't find server", no
+/// line in the event log, and the server's own log showed the request never arrived. One line per
+/// failure, named like the DNS line beside it: the stage, the method, the endpoint without its
+/// query (`log_endpoint`), the host it dialled, and the OS's reason. Teardown aborts never get
+/// here; only `Transport` failures do.
+fn log_transport_failure(stage: &str, method: &str, path: &str, host: &str, port: c_int, why: &str) {
+    crate::log(&format!(
+        "stream: {method} {} {stage} host={host}:{port} — {why}",
+        log_endpoint(path)
+    ));
+}
+
+/// `errno=N (text)` for a failure line; `0` reads as "no error recorded", which is itself a fact.
+fn errno_text(e: c_int) -> String {
+    if e == 0 {
+        "no errno recorded".to_owned()
+    } else {
+        format!("errno={e} ({})", std::io::Error::from_raw_os_error(e))
+    }
+}
+
 fn retry_interrupted_recv(result: isize, error: c_int) -> bool {
     result != HTTP_READ_DEADLINE as isize
         && result != HTTP_READ_STOPPED as isize
@@ -790,7 +819,9 @@ unsafe fn connect_timeout_cause(
     if libc::connect(fd, sa, salen) == 0 {
         return restore(ConnectAttempt::Connected); // connected immediately (loopback / same host)
     }
-    if errno() != libc::EINPROGRESS {
+    let e = errno();
+    if e != libc::EINPROGRESS {
+        LAST_CONNECT_ERR.with(|c| c.set(e));
         return restore(ConnectAttempt::Failed);
     }
     let mut pfd = libc::pollfd {
@@ -825,7 +856,9 @@ unsafe fn connect_timeout_cause(
             }
             return restore(ConnectAttempt::TimedOut); // the host is not answering
         }
-        if errno() != libc::EINTR {
+        let e = errno();
+        if e != libc::EINTR {
+            LAST_CONNECT_ERR.with(|c| c.set(e));
             return restore(ConnectAttempt::Failed);
         }
         end = Instant::now(); // a signal ate the wait; poll once more without blocking again
@@ -842,6 +875,7 @@ unsafe fn connect_timeout_cause(
     ) < 0
         || err != 0
     {
+        LAST_CONNECT_ERR.with(|c| c.set(if err != 0 { err } else { errno() }));
         return restore(ConnectAttempt::Failed);
     }
     restore(ConnectAttempt::Connected)
@@ -1393,7 +1427,13 @@ fn http_open_with_timeouts(
             Err(ConnectFailure::TimedOut) if caller_deadline_is_connect_ceiling => {
                 return Err(HttpOpenError::Deadline);
             }
-            Err(ConnectFailure::TimedOut | ConnectFailure::Transport) => {
+            Err(ConnectFailure::TimedOut) => {
+                log_transport_failure("CONNECT FAILED", method, &path_s, &host_s, port, "timed out");
+                return Err(HttpOpenError::Transport);
+            }
+            Err(ConnectFailure::Transport) => {
+                let why = errno_text(LAST_CONNECT_ERR.with(|c| c.replace(0)));
+                log_transport_failure("CONNECT FAILED", method, &path_s, &host_s, port, &why);
                 return Err(HttpOpenError::Transport);
             }
         };
@@ -1471,6 +1511,7 @@ unsafe fn perform_http_request(
             pacer,
         );
         if w <= 0 {
+            let e = errno();
             let error = if hs.interrupted() {
                 HttpOpenError::Aborted
             } else if w == HTTP_READ_DEADLINE as isize {
@@ -1480,6 +1521,9 @@ unsafe fn perform_http_request(
             } else {
                 HttpOpenError::Transport
             };
+            if matches!(error, HttpOpenError::Transport) {
+                log_transport_failure("SEND FAILED", method, path_s, host_s, port, &errno_text(e));
+            }
             close_owned(hs);
             return Err(error);
         }
@@ -1499,6 +1543,7 @@ unsafe fn perform_http_request(
             pacer,
         );
         if w <= 0 {
+            let e = errno();
             let error = if hs.interrupted() {
                 HttpOpenError::Aborted
             } else if w == HTTP_READ_DEADLINE as isize {
@@ -1508,6 +1553,9 @@ unsafe fn perform_http_request(
             } else {
                 HttpOpenError::Transport
             };
+            if matches!(error, HttpOpenError::Transport) {
+                log_transport_failure("SEND FAILED", method, path_s, host_s, port, &errno_text(e));
+            }
             close_owned(hs);
             return Err(error);
         }
@@ -1529,6 +1577,7 @@ unsafe fn perform_http_request(
         // r == 0 is also how an interrupted open surfaces: `http_shutdown` wakes this
         // recv with EOF, so a teardown mid-header costs one syscall, not 15 s of SO_RCVTIMEO.
         if r <= 0 {
+            let e = errno();
             let error = if hs.interrupted() {
                 HttpOpenError::Aborted
             } else if r == HTTP_READ_DEADLINE as isize {
@@ -1538,6 +1587,14 @@ unsafe fn perform_http_request(
             } else {
                 HttpOpenError::Transport
             };
+            if matches!(error, HttpOpenError::Transport) {
+                let why = if r == 0 {
+                    format!("connection closed after {} response bytes", hs.blen)
+                } else {
+                    format!("{} after {} response bytes", errno_text(e), hs.blen)
+                };
+                log_transport_failure("NO RESPONSE", method, path_s, host_s, port, &why);
+            }
             close_owned(hs);
             return Err(error);
         }
