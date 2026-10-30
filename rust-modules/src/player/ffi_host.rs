@@ -639,6 +639,10 @@ pub(super) unsafe fn sf_quarantine() {
 /// With the clock sink armed this becomes `VP_EXPORTED`, the webOS 5+ path: video binds through an
 /// exported window id and ACB is never touched, so the engine's ACB stage sequence stays SKIPPED
 /// rather than faked. Faking ACB would mean modelling a bind order this file cannot verify.
+/// The simulator has no LG library, so there is no pre-C++11 `Feed` to report.
+pub(super) unsafe fn sf_feed_abi_is_cow() -> c_int {
+    0
+}
 pub(super) unsafe fn vp_mode() -> c_int {
     if enabled() {
         super::VP_EXPORTED

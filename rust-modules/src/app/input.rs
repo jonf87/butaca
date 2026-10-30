@@ -30,7 +30,7 @@ use super::*;
 /// that gate to click at all).
 pub(crate) struct Pointer {
     pub(crate) dpad_mode: bool,  // D-pad input owns focus; pointer motion below the gate is ignored
-    pub(crate) cur_hidden: bool, // the LG cursor is hidden right now
+    pub(crate) cur_hidden: bool, // the pointer is hidden right now (LG's hide or the transparent cursor)
     pub(crate) mot_accum: f32,   // motion accumulated since D-pad mode was entered, in logical px
     pub(crate) prev_mx: f32,     // last motion's position, for that accumulation (-1 = none yet)
     pub(crate) prev_my: f32,
@@ -46,6 +46,9 @@ pub(crate) struct Pointer {
     /// decides whether a motion event is dispatched as `InputKind::Pointer` or `InputKind::Drag`.
     pub(crate) button_down: bool,
     pub(crate) last_wheel: u32,  // last wheel tick, for the wheel's own debounce
+    /// The button now held went DOWN as an OK key, not a click ([`click_is_ok`]), so its up must
+    /// be an OK key-up too.
+    pub(crate) ok_from_click: bool,
 }
 impl Pointer {
     /// Pointer mode, cursor shown, nothing held or dragging — where the loop starts.
@@ -58,8 +61,35 @@ impl Pointer {
         last_motion: 0,
         button_down: false,
         last_wheel: 0,
+        ok_from_click: false,
     };
 }
+
+/// **Is this pointer click really the remote's OK button?**
+///
+/// On a set without LG's `SDL_webOSCursorVisibility` (webOS 3.x's SDL 2.0.3/2.0.4) the app hides
+/// the pointer by swapping in a transparent cursor (`boot::hide_cursor`). The system still
+/// believes its pointer is up, so the Magic Remote's OK arrives as a CLICK at wherever that
+/// invisible pointer sits, never as an OK key: the viewer arrows to a control, presses OK, and the
+/// click lands on whatever is under the hidden pointer (in the player, the picture, which toggles
+/// pause — measured upstream on a webOS 3.9.3 set, PlxNative #781). Where LG's call exists the
+/// system hides its own pointer and OK arrives as a key, so the click never comes.
+///
+/// So while the D-pad owns focus on a transparent-cursor set, a click is the OK key on the focused
+/// control when either the pointer has not travelled far enough to leave D-pad mode
+/// ([`DPAD_MOTION_GATE`]) or it lands on no control at all. **Not "while the pointer is
+/// hidden"**: pressing OK jiggles a Magic Remote, any motion at all shows the pointer again, and a
+/// fix keyed on `cur_hidden` never fired on the device. **Nor travel alone**: travel is summed
+/// since the last D-pad press, so a hand simply holding the remote drifts past any gate (measured
+/// upstream: 600 px between three arrows and OK, PlxNative #803). A click that lands ON a control
+/// after real travel is still that control's.
+pub(crate) fn click_is_ok(dpad_mode: bool, motion_since_dpad: f32, on_control: bool, transparent_cursor: bool) -> bool {
+    dpad_mode && transparent_cursor && (motion_since_dpad < DPAD_MOTION_GATE || !on_control)
+}
+
+/// Pointer travel, in logical px accumulated since the last D-pad press, that hands focus back to
+/// the pointer: below it, motion is the hand holding the remote, not a deliberate move.
+pub(crate) const DPAD_MOTION_GATE: f32 = 120.0;
 
 // `home_activate` (the OK/pointer activation ladder for the legacy Home grid) was retired with
 // the legacy `ui::home` module when phase 8 made Home an owned `Screen` — its job (trail reset,
@@ -742,11 +772,10 @@ pub(crate) unsafe fn begin_fresh_press(
 /// **The two GLOBAL effects of a fresh press, and the guard that decides whether they happen** —
 /// the half of [`begin_fresh_press`] that LG checklist item 40 is about, and its only caller.
 ///
-/// Split out for one blunt reason: `begin_fresh_press` calls `hide_cursor`, which names a
-/// webOS-only SDL symbol, so a host test that reaches it fails at `ld` rather than at an assertion
-/// (the boundary the testing section of `docs/agent-reference.md` describes — the crate links today only
-/// because nothing reachable from a test calls it and the linker dead-strips it). This half touches
-/// no SDL at all, so the invariant is gradeable by `make check` instead of only by a television.
+/// Split out for one blunt reason: `begin_fresh_press` calls `hide_cursor`, which acts on whatever
+/// pointer calls the process's SDL exports (resolved at run time, `app/boot.rs`), so a host test
+/// that reached it would be grading the host's SDL rather than the press. This half touches no SDL
+/// at all, so the invariant is gradeable by `make check` instead of only by a television.
 pub(crate) fn note_global_press(
     ps: &crate::route::PlaybackSession,
     sym: c_uint,
@@ -1356,4 +1385,28 @@ pub(crate) fn back_at_root() {
 /// host left for a fade to run over (what `settings::hide()` used to say).
 pub(crate) fn delete_all_local_data_and_sign_out(pages: &mut crate::ui::dispatch::Dispatcher<super::bridge::AppHost>) {
     super::bridge::execute_session_command(pages, crate::auth::SessionCmd::EraseLocal);
+}
+
+#[cfg(test)]
+mod click_is_ok_tests {
+    use super::click_is_ok;
+
+    /// A webOS 3.x set hides the pointer by the transparent cursor, so OK arrives as a click — it
+    /// is the OK key, including after the jiggle a press itself causes. Anywhere else a click is a
+    /// click: the pointer was moved on purpose (past the gate, or out of D-pad mode), or LG's own
+    /// hide made OK a real key already.
+    #[test]
+    fn a_click_in_dpad_mode_on_a_transparent_cursor_set_is_ok_unless_the_pointer_moved_onto_a_control() {
+        assert!(click_is_ok(true, 0.0, true, true));
+        assert!(click_is_ok(true, 6.0, true, true), "the jiggle of pressing OK is still OK");
+        assert!(click_is_ok(true, 600.0, false, true), "drift onto bare video is still OK");
+        for (dpad, motion, on_control, transparent) in [
+            (true, super::DPAD_MOTION_GATE, true, true),
+            (true, 500.0, true, true),
+            (false, 0.0, false, true),
+            (true, 0.0, false, false),
+        ] {
+            assert!(!click_is_ok(dpad, motion, on_control, transparent), "{dpad} {motion} {on_control} {transparent}");
+        }
+    }
 }

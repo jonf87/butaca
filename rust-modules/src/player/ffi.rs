@@ -45,6 +45,7 @@ mod sys {
         pub(super) fn sf_set_content_info(position_ns: i64) -> c_int;
         pub(super) fn sf_send_segment() -> c_int;
         pub(super) fn sf_feed(p: *const u8, size: c_uint, pts: i64, es_data: c_int) -> c_char;
+        pub(super) fn sf_feed_abi_is_cow() -> c_int;
         pub(super) fn sf_unload();
         pub(super) fn sf_callback_gate_retire() -> c_int;
         pub(super) fn sf_callback_intercepts() -> c_uint;
@@ -265,6 +266,15 @@ pub(crate) const VP_EXPORTED: c_int = 2;
 #[inline]
 pub(crate) fn vp_mode() -> c_int {
     unsafe { sys::vp_mode() }
+}
+
+/// True when the library's `Feed` is the pre-C++11 copy-on-write-string build (webOS 3.x): direct
+/// evidence that its `StarfishMediaAPIs` layout is not the 4.5 one the in-place seek offsets were
+/// decompiled from. Takes no token for `vp_mode`'s reason: the seam resolves it once under
+/// `pthread_once` and this only reads the memoized answer.
+#[inline]
+pub(crate) fn feed_abi_is_cow() -> bool {
+    unsafe { sys::sf_feed_abi_is_cow() != 0 }
 }
 
 /// The exported windowId the seam holds, or an empty string when none was created. Diagnostics
