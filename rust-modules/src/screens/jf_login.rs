@@ -228,6 +228,35 @@ fn commit_text(fields: &mut [String; 3], editing: Option<usize>, text: &str) -> 
     true
 }
 
+/// What a key press does while a field is being edited.
+#[derive(Debug, PartialEq, Eq)]
+enum EditingKey {
+    Backspace,
+    Clear,
+    /// Commit the field and drop the keyboard; `move_focus` hands the press on to the focus
+    /// engine so it lands on the next row as well.
+    Leave { move_focus: bool },
+    Swallow,
+}
+
+/// **Every key but the two edit keys used to be swallowed while a field was editing**, and only
+/// OK ended the edit. The television's keyboard can close itself without the app hearing about it
+/// (its own Done/Enter, or the remote pointed away) — on a webOS 3.8 set that left the form stuck
+/// on the field: the arrows reached the app, the event log showed them, and every one was eaten.
+/// So, as search does: an arrow that reaches the app means the keyboard is not taking it, and
+/// Up/Down commit the field and move on; BACK commits it, as this module's doc always said it
+/// did. Left/Right stay swallowed: the field has no caret to move and the form is one column.
+fn editing_key(key: crate::ui::machine::Key, sym: u32) -> EditingKey {
+    use crate::ui::machine::Key;
+    match (key, sym) {
+        (Key::Other, crate::ui::consts::SDLK_BACKSPACE) => EditingKey::Backspace,
+        (Key::Other, crate::ui::consts::SDLK_CLEAR) => EditingKey::Clear,
+        (Key::Up | Key::Down, _) => EditingKey::Leave { move_focus: true },
+        (Key::Back, _) => EditingKey::Leave { move_focus: false },
+        _ => EditingKey::Swallow,
+    }
+}
+
 /// The reason line under the narrative — one sentence per failure, worded for a couch, not a
 /// console. The two address failures are told apart because their fixes are different verbs:
 /// retype it, or serve it over TLS / from the LAN.
@@ -322,20 +351,28 @@ impl<H: AppLike> Machine<H> for JfLoginScreen {
                     if let Some(f) = self.editing {
                         // The panel's edit protocol, per search's key handler: backspace and
                         // clear arrive as keys (the system keyboard's own codes), the printable
-                        // text as SDL_TEXTINPUT.
-                        match (key, sym) {
-                            (Key::Other, crate::ui::consts::SDLK_BACKSPACE) => {
+                        // text as SDL_TEXTINPUT; see `editing_key` for the rest.
+                        let handled = match editing_key(key, sym) {
+                            EditingKey::Backspace => {
                                 self.fields[f].pop();
                                 self.dirty = true;
+                                Handled::Yes
                             }
-                            (Key::Other, crate::ui::consts::SDLK_CLEAR) => {
+                            EditingKey::Clear => {
                                 self.fields[f].clear();
                                 self.dirty = true;
+                                Handled::Yes
                             }
-                            _ => {}
-                        }
+                            EditingKey::Leave { move_focus } => {
+                                self.editing = None;
+                                crate::textinput::stop();
+                                self.dirty = true;
+                                if move_focus { Handled::No } else { Handled::Yes }
+                            }
+                            EditingKey::Swallow => Handled::Yes,
+                        };
                         fx.invalidate(crate::ui::present::Provenance::Input);
-                        Handled::Yes
+                        handled
                     } else if key == Key::Back {
                         // BACK with no edit in flight: the boot gate's form keeps swallowing it
                         // (nothing lives behind a first-ever boot's sign-in), but the Settings
@@ -521,5 +558,33 @@ mod tests {
         // …and with no edit in flight, text is dropped rather than smeared across field 0.
         assert!(!commit_text(&mut fields, None, "junk"));
         assert_eq!(fields[F_SERVER], "192.168.1.20");
+    }
+}
+
+#[cfg(test)]
+mod editing_key_tests {
+    use super::{editing_key, EditingKey};
+    use crate::ui::consts::{SDLK_BACKSPACE, SDLK_CLEAR, SDLK_DOWN, SDLK_UP};
+    use crate::ui::machine::Key;
+
+    /// The webOS 3.8 regression: with a field still editing, Down was swallowed and the form could
+    /// not be left. It must commit the field and let the focus engine move.
+    #[test]
+    fn up_and_down_leave_the_field_and_move_on() {
+        assert_eq!(editing_key(Key::Down, SDLK_DOWN), EditingKey::Leave { move_focus: true });
+        assert_eq!(editing_key(Key::Up, SDLK_UP), EditingKey::Leave { move_focus: true });
+    }
+
+    #[test]
+    fn back_commits_the_field_and_stays_on_it() {
+        assert_eq!(editing_key(Key::Back, 0), EditingKey::Leave { move_focus: false });
+    }
+
+    #[test]
+    fn the_edit_keys_still_edit_and_the_rest_is_swallowed() {
+        assert_eq!(editing_key(Key::Other, SDLK_BACKSPACE), EditingKey::Backspace);
+        assert_eq!(editing_key(Key::Other, SDLK_CLEAR), EditingKey::Clear);
+        assert_eq!(editing_key(Key::Left, 0), EditingKey::Swallow);
+        assert_eq!(editing_key(Key::Other, 0), EditingKey::Swallow);
     }
 }

@@ -116,6 +116,13 @@ jobs:
         # `make LAB=1`'s requirement (a live session secret), not the compiler's.
         run: cd rust-modules && cargo "+$RUST_NIGHTLY" check --lib --tests --features lab-diagnostics
 
+      - name: Test the Jellyfin sign-in screen
+        # `jellyfin` is not in the default set either, and `make check` does not pass it, so
+        # `screens/jf_login.rs` — the sign-in form of the app this fork ships — was compiled only
+        # by the cross-build and its tests ran nowhere. Filtered to that module: the point is that
+        # its own tests run, not to adopt every other jellyfin-gated test in the same step.
+        run: cd rust-modules && cargo "+$RUST_NIGHTLY" test --lib --features jellyfin screens::jf_login
+
       - name: Report suite size
         # CLAUDE.md's stated test count has gone stale twice. Print the real number rather than
         # trusting a doc: the count is a fact the suite can produce about itself.
