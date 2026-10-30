@@ -793,15 +793,13 @@ impl JfClient {
 
     /// Absolutize a `TranscodingUrl` with the auth riding as `api_key`, the same shape as every
     /// built path — the HLS playlist and every segment it lists are fetched by URL alone, with
-    /// no header slot to carry a token in.
+    /// no header slot to carry a token in. See [`with_single_api_key`] for why it is exactly one.
     pub(crate) fn transcode_url(&self, transcoding_url: &str) -> Option<String> {
         let token = self.token.read().unwrap().as_ref()?.token.clone();
-        let sep = if transcoding_url.contains('?') { "&" } else { "?" };
         Some(format!(
-            "{}{}{}api_key={token}",
+            "{}{}",
             self.origin.base(),
-            transcoding_url,
-            sep
+            with_single_api_key(transcoding_url, &token)
         ))
     }
 
@@ -1062,6 +1060,45 @@ fn method_name(m: http::Method) -> &'static str {
         http::Method::Put => "PUT",
         http::Method::Post => "POST",
         http::Method::Delete => "DELETE",
+    }
+}
+
+/// `transcoding_url` with ONE `api_key={token}` and no other access-token parameter. The HLS
+/// transport (`hls::InheritedAuth`) refuses a master that carries two credentials, and a server
+/// may already have put its own key in the `TranscodingUrl` it hands back (`api_key`, or `ApiKey`
+/// in Jellyfin's newer spelling): appending ours beside it would be that refusal. Any such
+/// parameter is dropped, whatever its value, and ours — the session's own token — is appended.
+fn with_single_api_key(transcoding_url: &str, token: &str) -> String {
+    let (path, query) = transcoding_url.split_once('?').unwrap_or((transcoding_url, ""));
+    let mut kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+            !pair.is_empty() && !name.eq_ignore_ascii_case("api_key") && !name.eq_ignore_ascii_case("ApiKey")
+        })
+        .collect();
+    let key = format!("api_key={token}");
+    kept.push(&key);
+    format!("{path}?{}", kept.join("&"))
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    use super::with_single_api_key;
+
+    #[test]
+    fn exactly_one_api_key_whatever_the_server_put_there() {
+        assert_eq!(with_single_api_key("/videos/x/master.m3u8", "t"), "/videos/x/master.m3u8?api_key=t");
+        assert_eq!(
+            with_single_api_key("/videos/x/master.m3u8?DeviceId=d&MediaSourceId=m", "t"),
+            "/videos/x/master.m3u8?DeviceId=d&MediaSourceId=m&api_key=t"
+        );
+        assert_eq!(
+            with_single_api_key("/videos/x/master.m3u8?ApiKey=server&DeviceId=d&api_key=old", "t"),
+            "/videos/x/master.m3u8?DeviceId=d&api_key=t",
+            "a server-supplied key in either spelling is replaced, not doubled"
+        );
+        assert_eq!(with_single_api_key("/m.m3u8?&DeviceId=d", "t"), "/m.m3u8?DeviceId=d&api_key=t");
     }
 }
 

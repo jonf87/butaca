@@ -19,17 +19,30 @@ pub(crate) struct Resource {
 }
 
 /// Authentication captured from the route-owned master URL and applied only at the transport
-/// boundary. HLS URI resolution does not inherit a query, but PMS requires the Plex token on the
-/// master, child manifest and every segment request. Keeping it out of [`Resource`] means parsed
+/// boundary. HLS URI resolution does not inherit a query, but the server requires its credential
+/// on the master, child manifest and every segment request — PMS's `X-Plex-Token`, or Jellyfin's
+/// `api_key` (`ApiKey` in its newer spelling). Keeping it out of [`Resource`] means parsed
 /// playlist values and their `Debug` output can never become a credential store.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct InheritedAuth {
     token_pair: String,
 }
 
+/// The query parameters that carry a server credential, matched case-insensitively: PMS's token
+/// and Jellyfin's two spellings of its access token. A Jellyfin transcode's master URL carries
+/// `api_key` and nothing else (`jellyfin::client::transcode_url` guarantees exactly one), and the
+/// check used to know only the Plex name — so every Jellyfin transcode failed at the master with
+/// "no unique credential", before a byte was fetched.
+const CREDENTIAL_PARAMS: [&str; 3] = ["X-Plex-Token", "api_key", "ApiKey"];
+
+/// The value of a credential pair, `None` for any other parameter.
+fn credential_value(pair: &str) -> Option<&str> {
+    let (name, value) = pair.split_once('=')?;
+    CREDENTIAL_PARAMS.iter().any(|p| name.eq_ignore_ascii_case(p)).then_some(value)
+}
+
 fn is_token_pair(pair: &str) -> bool {
-    pair.split_once('=')
-        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("X-Plex-Token"))
+    credential_value(pair).is_some()
 }
 
 impl fmt::Debug for InheritedAuth {
@@ -48,7 +61,7 @@ impl InheritedAuth {
         let mut found = query.split('&').filter(|pair| is_token_pair(pair));
         let token_pair = found
             .next()
-            .filter(|pair| pair.len() > "X-Plex-Token=".len())
+            .filter(|pair| credential_value(pair).is_some_and(|v| !v.is_empty()))
             .ok_or(Error::MissingCredential)?;
         if found.next().is_some() {
             return Err(Error::MultipleCredentials);
@@ -59,12 +72,13 @@ impl InheritedAuth {
     }
 
     /// A request path for the same-origin transport. A playlist may repeat the route credential,
-    /// but it may not replace it with another value.
+    /// but it may not replace it with another value. Compared by VALUE: a server that echoes the
+    /// same token under its other spelling (Jellyfin's `api_key`/`ApiKey`) is repeating it.
     pub(crate) fn request_path(&self, resource: &Resource) -> Result<String, Error> {
         if let Some((_, query)) = resource.path.split_once('?') {
             let mut found = query.split('&').filter(|pair| is_token_pair(pair));
             if let Some(pair) = found.next() {
-                if pair != self.token_pair {
+                if credential_value(pair) != credential_value(&self.token_pair) {
                     return Err(Error::CredentialChanged);
                 }
                 if found.next().is_some() {
@@ -454,9 +468,9 @@ impl fmt::Display for Error {
                 write!(f, "segment {sequence} appeared after ENDLIST")
             }
             Self::StaleEndList => f.write_str("ENDLIST came from a playlist older than the cursor"),
-            Self::MissingCredential => f.write_str("HLS master URL has no Plex credential"),
+            Self::MissingCredential => f.write_str("HLS master URL has no server credential"),
             Self::MultipleCredentials => {
-                f.write_str("HLS master URL has multiple Plex credentials")
+                f.write_str("HLS master URL has multiple server credentials")
             }
             Self::CredentialChanged => f.write_str("playlist URI replaces the route credential"),
             Self::DurationOverflow => f.write_str("HLS timeline duration overflows"),
@@ -1439,6 +1453,37 @@ mod tests {
                 "/segment.ts?X-Plex-Token=top-secret&x-plex-token=top-secret"
             )),
             Err(Error::MultipleCredentials)
+        );
+    }
+
+    /// The Jellyfin transcode regression: a master carrying only `api_key` was refused as having
+    /// no credential, so no Jellyfin transcode ever played.
+    #[test]
+    fn a_jellyfin_api_key_is_the_route_credential() {
+        let master = source("/videos/x/master.m3u8?DeviceId=d&MediaSourceId=m&api_key=jf-tok");
+        let auth = InheritedAuth::capture(&master).unwrap();
+        let child = master.resolve("main.m3u8?DeviceId=d").unwrap();
+        assert_eq!(auth.request_path(&child).unwrap(), "/videos/x/main.m3u8?DeviceId=d&api_key=jf-tok");
+        assert_eq!(
+            auth.request_path(&source("/videos/x/hls1/main/0.ts?ApiKey=jf-tok")).unwrap(),
+            "/videos/x/hls1/main/0.ts?ApiKey=jf-tok",
+            "the same token under Jellyfin's other spelling is a repeat, not a replacement"
+        );
+        assert_eq!(
+            auth.request_path(&source("/videos/x/hls1/main/0.ts?ApiKey=other")),
+            Err(Error::CredentialChanged)
+        );
+        assert_eq!(
+            InheritedAuth::capture(&source("/m.m3u8?api_key=a&ApiKey=a")),
+            Err(Error::MultipleCredentials)
+        );
+        assert_eq!(InheritedAuth::capture(&source("/m.m3u8?api_key=")), Err(Error::MissingCredential));
+        assert_eq!(
+            Resource::from_request_path(Origin::http("192.0.2.10", 32400), "/seg.ts?a=1&api_key=jf-tok")
+                .unwrap()
+                .path,
+            "/seg.ts?a=1",
+            "the token never stays in a Resource"
         );
     }
 
